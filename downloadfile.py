@@ -1,10 +1,14 @@
 
-import string
-import requests
-from lxml import etree
-from io import TextIOWrapper
-import sqlalchemy
 import os
+import shutil
+import string
+import subprocess
+from io import TextIOWrapper
+
+import lupa
+import requests
+import sqlalchemy
+from lxml import etree
 
 wiki_namespace = '{http://www.mediawiki.org/xml/export-0.10/}'
 database_name = 'traveling_word_pages.db'
@@ -78,5 +82,37 @@ def extract_modules():
             os.makedirs(directory)
         with open(file_path, 'w+') as f:
             f.write(row['text'])
+    
+def luatable_to_list(luatable) -> list:
+    python_list = []
+    for value in luatable.values():
+        if lupa._lupa.lua_type(value) == 'table':
+            python_list.append(luatable_to_python(value))
+        else:
+            python_list.append(value)
+    return python_list
 
-        
+def luatable_to_dict(luatable) -> dict:
+    python_dict = {}
+    for key, value in luatable.items():
+        if lupa._lupa.lua_type(value) == 'table':
+            python_dict[key] = luatable_to_python(value)
+        else:
+            python_dict[key] = value
+    return python_dict
+
+def luatable_to_python(luatable):
+    for i, key in enumerate(luatable.keys(), 1):
+        print(f'{i}, {key}, {luatable[key]}, {lupa._lupa.lua_type(luatable[key])}')
+        if i != key:
+            return luatable_to_dict(luatable)
+    return luatable_to_list(luatable)
+
+def list_scripts() -> dict:
+    lua = lupa.LuaRuntime()
+    with open('Module2/mw.lua') as mw_file, \
+            open('Module2/Module:scripts/data.lua') as script_file:
+        lua.execute(mw_file.read())
+        program = script_file.read()
+        luatable = lua.execute(program)
+        return luatable_to_dict(luatable)
