@@ -3,81 +3,94 @@ from io import TextIOWrapper
 
 import lupa
 import sqlalchemy
+from sqlalchemy import orm
 from lxml import etree
 
 WIKI_NAMESPACE = '{http://www.mediawiki.org/xml/export-0.10/}'
 DATABASE_NAME = 'traveling_word_pages.db'
 XML_DUMP_FILENAME = 'enwiktionary-20180720-pages-meta-current.xml'
 ENGINE = sqlalchemy.create_engine('sqlite:///' + DATABASE_NAME)
+BASE = sqlalchemy.ext.declarative.declarative_base()
 
 METADATA = sqlalchemy.MetaData()
+SESSION = orm.sessionmaker(bind=ENGINE)
 
-PAGES = sqlalchemy.Table(
-    'pages',
-    METADATA,
-    sqlalchemy.Column('id', sqlalchemy.Integer, primary_key=True),
-    sqlalchemy.Column('title', sqlalchemy.String, index=True, nullable=False),
-    sqlalchemy.Column('namespace', sqlalchemy.Integer, index=True, nullable=False),
-    sqlalchemy.Column('text', sqlalchemy.Text, nullable=False)
-)
+class Page(BASE):
+    __tablename__ = 'pages'
+    id = sqlalchemy.Column(sqlalchemy.Integer, primary_key=True)
+    title = sqlalchemy.Column(sqlalchemy.Unicode, index=True, nullable=False)
+    namespace = sqlalchemy.Column(sqlalchemy.Integer, index=True, nullable=False)
+    text = sqlalchemy.Column(sqlalchemy.UnicodeText, nullable=False)
 
-SCRIPTS = sqlalchemy.Table(
-    'scripts',
-    METADATA,
-    sqlalchemy.Column('code', sqlalchemy.String, primary_key=True),
-    sqlalchemy.Column('canonicalName', sqlalchemy.String, index=True, nullable=False),
-    sqlalchemy.Column('character_category', sqlalchemy.Boolean, index=True, nullable=False, default=True),
-    sqlalchemy.Column('characters', sqlalchemy.String),
-    sqlalchemy.Column('direction', sqlalchemy.String, index=True),
-    sqlalchemy.Column('otherNames', sqlalchemy.JSON),
-    sqlalchemy.Column('systems', sqlalchemy.JSON)
-)
+    def __init__(self, page_id: int, title: str, namespace: int, text: str):
+        self.page_id = page_id
+        self.title = title
+        self.namespace = namespace
+        self.text = text
+
+    @classmethod
+    def create_from_element(cls, element: etree.Element) -> cls:
+        for child in element:
+            if child.tag == WIKI_NAMESPACE + 'title':
+                title = child.text
+            elif child.tag == WIKI_NAMESPACE + 'ns':
+                namespace = child.text
+            elif child.tag == WIKI_NAMESPACE + 'id':
+                page_id = int(child.text)
+            elif child.tag == WIKI_NAMESPACE + 'revision':
+                for grandchild in child:
+                    if grandchild.tag == WIKI_NAMESPACE + 'text':
+                        text = grandchild.text
+        return cls(page_id, title, namespace, text)
+
+class ScriptSystem(BASE):
+    __tablename__ = 'script_systems'
+    system = sqlalchemy.Column(sqlalchemy.Unicode, primary_key=True, nullable=False)
+
+class ScriptName(BASE):
+    __tablename__ = 'script_names'
+    name = sqlalchemy.Column(sqlalchemy.Unicode, primary_key=True, nullable=False)
+
+class Script(BASE):
+    code = sqlalchemy.Column(sqlalchemy.Unicode, primary_key=True, nullable=False)
+    canonicalName = sqlalchemy.Column(sqlalchemy.Unicode, index=True, nullable=False)
+    character_catagory = sqlalchemy.Column(sqlalchemy.Boolean, index=True, nullable=False, default=True)
+    characters = sqlalchemy.Column(sqlalchemy.Unicode)
+    direction = sqlalchemy.Column(sqlalchemy.Unicode, index=True)
+    otherNames = sqlalchemy.orm.relationship('ScriptName', back_populates='scripts')
+    systems = sqlalchemy.orm.relationship('ScriptSystem', back_populates='scripts')
 
 def page_elements(f: TextIOWrapper) -> etree.Element:
     in_page = False
-    for ev, el in etree.iterparse(f, ('start', 'end')):
-        if ev == 'start':
-            if el.tag == WIKI_NAMESPACE + 'page':
+    for event, element in etree.iterparse(f, ('start', 'end')):
+        if event == 'start':
+            if element.tag == WIKI_NAMESPACE + 'page':
                 in_page = True
         else:
-            if el.tag == WIKI_NAMESPACE + 'page':
-                yield el
-                el.clear()
+            if element.tag == WIKI_NAMESPACE + 'page':
+                yield element
+                element.clear()
                 in_page = False
             else:
                 if not in_page:
-                    el.clear()
+                    element.clear()
  
 def xml_to_db(breakcount=10000) -> None:
     METADATA.create_all(ENGINE)
     page_buffer = []
-    connection = ENGINE.connect()
+    session = SESSION()
     mistakes = 0
     with open(XML_DUMP_FILENAME, 'rb') as f:
         for i, element in enumerate(page_elements(f), 1):
-            page = create_from_element(element)
-            if page['text']:
-                page_buffer.append(page)
+            page = Page.create_from_element(element)
+            page_buffer.append(page)
+            session.add_all(page_buffer)
             if not i % breakcount:
-                connection.execute(PAGES.insert(page_buffer))
-                print(f'pages loaded: {i},  last one: {page["title"]}')
+                session.Commit()
+                print(f'pages loaded: {i},  last one: {page.title}')
                 page_buffer = []
-        connection.execute(PAGES.insert(page_buffer))
+        session.add_all(page_buffer)
         print(f'mistakes: {mistakes}')
-
-def create_from_element(el: etree.Element) -> dict:
-    for child in el:
-        if child.tag == WIKI_NAMESPACE + 'title':
-            title = child.text
-        elif child.tag == WIKI_NAMESPACE + 'ns':
-            ns = child.text
-        elif child.tag == WIKI_NAMESPACE + 'id':
-            page_id = int(child.text)
-        elif child.tag == WIKI_NAMESPACE + 'revision':
-            for grandchild in child:
-                if grandchild.tag == WIKI_NAMESPACE + 'text':
-                    text = grandchild.text
-        return {'id': page_id, 'title': title, 'namespace': ns, 'text': text}
 
 def extract_modules():
     s = sqlalchemy.select([PAGES.c.title, PAGES.c.text]) \
