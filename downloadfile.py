@@ -1,9 +1,13 @@
 import os
 from io import TextIOWrapper
+from typing import List
 
 import lupa
 import sqlalchemy
-from sqlalchemy import orm
+from sqlalchemy import orm, Integer, Unicode, UnicodeText, Column, Boolean
+from sqlalchemy.orm import relationship
+from sqlalchemy.orm.session import Session
+from sqlalchemy.orm.exc import NoResultFound
 from lxml import etree
 
 WIKI_NAMESPACE = '{http://www.mediawiki.org/xml/export-0.10/}'
@@ -17,19 +21,21 @@ SESSION = orm.sessionmaker(bind=ENGINE)
 
 class Page(BASE):
     __tablename__ = 'pages'
-    id = sqlalchemy.Column(sqlalchemy.Integer, primary_key=True)
-    title = sqlalchemy.Column(sqlalchemy.Unicode, index=True, nullable=False)
-    namespace = sqlalchemy.Column(sqlalchemy.Integer, index=True, nullable=False)
-    text = sqlalchemy.Column(sqlalchemy.UnicodeText, nullable=False)
+    id = Column(Integer, primary_key=True)
+    title = Column(Unicode, index=True, nullable=False)
+    namespace = Column(Integer, index=True, nullable=False)
+    text = Column(UnicodeText, nullable=False)
 
-    def __init__(self, page_id: int, title: str, namespace: int, text: str):
+    def __init__(self, session: Session, page_id: int, title: str, namespace: int, text: str):
         self.page_id = page_id
         self.title = title
         self.namespace = namespace
         self.text = text
 
+        session.add(self)
+
     @classmethod
-    def create_from_element(cls, element: etree.Element) -> cls:
+    def create_from_element(cls, session: Session, element: etree.Element) -> cls:
         for child in element:
             if child.tag == WIKI_NAMESPACE + 'title':
                 title = child.text
@@ -41,24 +47,67 @@ class Page(BASE):
                 for grandchild in child:
                     if grandchild.tag == WIKI_NAMESPACE + 'text':
                         text = grandchild.text
-        return cls(page_id, title, namespace, text)
+        return cls(session, page_id, title, namespace, text)
+
+    @classmethod
+    def get_module_pages(cls, session: Session) -> List[cls]:
+        return session.query(cls).filter_by(namespace=828).filter(cls.title.notlike('%/documentation')).all()
 
 class ScriptSystem(BASE):
     __tablename__ = 'script_systems'
     system = sqlalchemy.Column(sqlalchemy.Unicode, primary_key=True, nullable=False)
 
+    def __init__(self, session: Session, system: str):
+        self.system = system
+
+        session.add(self)
+
+    # does not commit
+    @classmethod
+    def get_or_create(cls, session, system):
+        try:
+            return session.query(cls).filter_by(system=system).one()
+        except NoResultFound:
+            return cls(session, system)
+
 class ScriptName(BASE):
     __tablename__ = 'script_names'
     name = sqlalchemy.Column(sqlalchemy.Unicode, primary_key=True, nullable=False)
 
+    def __init__(self, session: Session, name: str):
+        self.name = name
+
+        session.add(self)
+
+    # does not commit
+    @classmethod
+    def get_or_create(cls, session, name):
+        try:
+            return session.query(cls).filter_by(name=name).one()
+        except NoResultFound:
+            return cls(session, name)
+
 class Script(BASE):
-    code = sqlalchemy.Column(sqlalchemy.Unicode, primary_key=True, nullable=False)
-    canonicalName = sqlalchemy.Column(sqlalchemy.Unicode, index=True, nullable=False)
-    character_catagory = sqlalchemy.Column(sqlalchemy.Boolean, index=True, nullable=False, default=True)
-    characters = sqlalchemy.Column(sqlalchemy.Unicode)
-    direction = sqlalchemy.Column(sqlalchemy.Unicode, index=True)
-    otherNames = sqlalchemy.orm.relationship('ScriptName', back_populates='scripts')
-    systems = sqlalchemy.orm.relationship('ScriptSystem', back_populates='scripts')
+    code = Column(Unicode, primary_key=True, nullable=False)
+    canonical_name = Column(Unicode, index=True, nullable=False)
+    character_category = Column(Boolean, index=True, nullable=False, default=True)
+    characters = Column(Unicode)
+    direction = sqlalchemy.Column(Unicode, index=True)
+    other_names = relationship('ScriptName', back_populates='scripts')
+    systems = relationship('ScriptSystem', back_populates='scripts')
+
+    def __init__(self, session, code: str, canonicalName: str, character_category: bool, characters: str, direction: str, otherNames: List[str] = [], systems: List[str] = []):
+        self.code = code
+        self.canonical_name = canonicalName
+        self.character_category = character_category
+        self.characters = characters
+        self.direction = direction
+        for other_name in otherNames:
+            self.other_names.append(ScriptName.get_or_create(session, other_name))
+        for system in systems:
+            self.systems.append(ScriptSystem.get_or_create(session, system))
+
+        session.add(self)
 
 def page_elements(f: TextIOWrapper) -> etree.Element:
     in_page = False
@@ -74,35 +123,26 @@ def page_elements(f: TextIOWrapper) -> etree.Element:
             else:
                 if not in_page:
                     element.clear()
- 
-def xml_to_db(breakcount=10000) -> None:
+
+def xml_to_db(session: Session, breakcount: int=10000) -> None:
     METADATA.create_all(ENGINE)
-    page_buffer = []
-    session = SESSION()
-    mistakes = 0
     with open(XML_DUMP_FILENAME, 'rb') as f:
         for i, element in enumerate(page_elements(f), 1):
-            page = Page.create_from_element(element)
-            page_buffer.append(page)
-            session.add_all(page_buffer)
+            Page.create_from_element(session, element)
             if not i % breakcount:
                 session.Commit()
                 print(f'pages loaded: {i},  last one: {page.title}')
-                page_buffer = []
-        session.add_all(page_buffer)
-        print(f'mistakes: {mistakes}')
+        session.Commit()
 
-def extract_modules():
-    s = sqlalchemy.select([PAGES.c.title, PAGES.c.text]) \
-        .where(PAGES.c.namespace == 828) \
-        .where(PAGES.c.title.notlike('%/documentation'))
-    for row in ENGINE.connect().execute(s):
-        file_path = 'Module/' + row['title'] + '.lua'
+def extract_modules(session: Session):
+    module_pages = Page.get_module_pages(session)
+    for module_page in module_pages:
+        file_path = 'Module/' + module_page.title + '.lua'
         directory = os.path.dirname(file_path)
         if not os.path.exists(directory):
             os.makedirs(directory)
         with open(file_path, 'w+') as f:
-            f.write(row['text'])
+            f.write(module_page.text)
     
 def luatable_to_list(luatable) -> list:
     python_list = []
@@ -124,12 +164,11 @@ def luatable_to_dict(luatable) -> dict:
 
 def luatable_to_python(luatable):
     for i, key in enumerate(luatable.keys(), 1):
-        print(f'{i}, {key}, {luatable[key]}, {lupa._lupa.lua_type(luatable[key])}')
         if i != key:
             return luatable_to_dict(luatable)
     return luatable_to_list(luatable)
 
-def list_scripts() -> list:
+def extract_scripts(session: Session) -> list:
     lua = lupa.LuaRuntime()
     with open('Module2/mw.lua') as mw_file, \
             open('Module2/Module:scripts/data.lua') as script_file:
@@ -139,10 +178,4 @@ def list_scripts() -> list:
         scripts_as_dict = luatable_to_dict(luatable)
         for key, value in scripts_as_dict.items():
             value['code'] = key
-        return scripts_as_dict.values
-
-def scripts_to_db() -> None:
-    scripts = list_scripts()
-    METADATA.create_all(ENGINE)
-    connection = ENGINE.connect()
-    connection.execute(SCRIPTS.insert(scripts))
+            Script(session, **value)
