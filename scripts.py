@@ -41,7 +41,7 @@ class Script(BASE):
 
     _other_names = Column('other_names', Unicode, index=True)
     @hybrid_property
-    def other_names(self) -> str:
+    def other_names(self) -> List[str]:
         return json.loads(self._other_names)
 
     _systems = Column('systems', Unicode, index=True)

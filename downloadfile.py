@@ -1,6 +1,8 @@
 import os
 from io import TextIOWrapper
 from typing import List
+from collections import defaultdict, OrderedDict
+import string
 
 import lupa
 import sqlalchemy
@@ -12,6 +14,8 @@ from lxml import etree
 
 from db_configuration import BASE, METADATA, ENGINE, SESSION
 from scripts import Script
+from families import Family
+from languages import Language
 from luatable_to_python import luatable_to_dict
 
 WIKI_NAMESPACE = '{http://www.mediawiki.org/xml/export-0.10/}'
@@ -54,7 +58,7 @@ class Page(BASE):
     def get_module_pages(cls, session: Session) -> 'List[Page]':
         return session.query(cls).filter_by(namespace=828).filter(cls.title.notlike('%/documentation')).all()
 
-def page_elements(f: TextIOWrapper) -> etree.Element:
+def yield_page_elements(f: TextIOWrapper) -> etree.Element:
     in_page = False
     for event, element in etree.iterparse(f, ('start', 'end')):
         if event == 'start':
@@ -71,7 +75,7 @@ def page_elements(f: TextIOWrapper) -> etree.Element:
 
 def xml_to_db(session: Session, breakcount: int = 10000) -> None:
     with open(XML_DUMP_FILENAME, 'rb') as f:
-        for i, element in enumerate(page_elements(f), 1):
+        for i, element in enumerate(yield_page_elements(f), 1):
             Page.create_from_element(session, element)
             if not i % breakcount:
                 session.Commit()
@@ -107,10 +111,48 @@ def extract_scripts(session: Session) -> List[Script]:
         return scripts
 
 def extract_families(session: Session):
-    lua = lupa.LuaRuntime()
-    with open('Module2/Module:families/data.lua') as family_file:
-        program = family_file.read()
-        luatable = lua.execute(program)
-        families_as_dict = luatable_to_dict(luatable)
-        return families_as_dict
+    family_dicts = execute_module('Module2/Module:families/data.lua')
+    ordered_family_dicts = order_dependencies(family_dicts, 'family')
+    families = {}
+    for code, value in ordered_family_dicts.items():
+        parent = families.get(value.pop('family', None), None)
+        family = Family(session, code, **value, family=parent)
+        families[code] = family
+    return families
+
+def language_module_names():
+    base = 'Module2/Module:languages/'
+    yield base + 'data2.lua'
+    for letter in string.ascii_lowercase:
+        yield base + 'data3/' + letter + '.lua'
+    yield base + 'datax.lua'
+
+def extract_languages(session: Session):
+    language_dicts = {}
+    for module_name in language_module_names():
+        language_dicts.update(execute_module(module_name))
+    return language_dicts
         
+def execute_module(module_name: str):
+    lua = lupa.LuaRuntime()
+    with open('Module2/mw.lua') as mw_file, \
+            open(module_name) as language_file:
+        lua.execute(mw_file.read())
+        program = language_file.read()
+        luatable = lua.execute(program)
+        return luatable_to_dict(luatable)
+
+def order_dependencies(source: dict, parentkey: str) -> OrderedDict:
+    bench = defaultdict(list)
+    target = OrderedDict()
+    while source:
+        key, value = source.popitem()
+        if not parentkey in value or value[parentkey] in target:
+            target[key] = value
+            benched_items = bench.pop(value.get(parentkey, None), [])
+            source.update(benched_items)
+        else:
+            bench[value[parentkey]].append((key, value))
+    return target
+
+
