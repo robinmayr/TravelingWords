@@ -1,56 +1,55 @@
-from typing import List
-
-import sqlalchemy
-from sqlalchemy import Column, Unicode, Boolean, ForeignKey
-from sqlalchemy.orm import relationship
-from sqlalchemy.orm.session import Session
-from sqlalchemy.orm.exc import NoResultFound
-from sqlalchemy.ext.hybrid import hybrid_property
+import typing
 import json
 
-from db_configuration import BASE
+import sqlalchemy as sqla
+from sqlalchemy import orm, schema
+from sqlalchemy.orm import session
+from sqlalchemy.ext import hybrid
 
-class Family(BASE):
+import db_configuration as db
+import luamodules
+
+class Family(db.base):
     __tablename__ = 'families'
 
-    _code = Column('code', Unicode, primary_key=True, nullable=False)
-    @hybrid_property
+    _code = sqla.Column('code', sqla.Unicode, primary_key=True, nullable=False)
+    @hybrid.hybrid_property
     def code(self) -> str:
         return self._code
 
-    _canonical_name = Column('canonical_name', Unicode, index=True, nullable=False)
-    @hybrid_property
+    _canonical_name = sqla.Column('canonical_name', sqla.Unicode, index=True, nullable=False)
+    @hybrid.hybrid_property
     def canonical_name(self) -> str:
         return self._canonical_name
 
-    _other_names = Column('other_names', Unicode, index=True)
-    @hybrid_property
+    _other_names = sqla.Column('other_names', sqla.Unicode, index=True)
+    @hybrid.hybrid_property
     def other_names(self) -> str:
         return json.loads(self._other_names)
 
-    _proto_language_code = Column('language_code', Unicode, ForeignKey('languages.code'), index=True)
-    _proto_language = relationship('Language', foreign_keys=[_proto_language_code])
-    @hybrid_property
+    _proto_language_code = sqla.Column('language_code', sqla.Unicode, schema.ForeignKey('languages.code'), index=True)
+    _proto_language = orm.relationship('Language', foreign_keys=[_proto_language_code])
+    @hybrid.hybrid_property
     def proto_language(self) -> 'Language':
         return self._proto_language
 
-    _family_code = Column('family_code', Unicode, ForeignKey(_code), index=True)
-    _family = relationship('Family', remote_side=_code)
-    @hybrid_property
+    _family_code = sqla.Column('family_code', sqla.Unicode, schema.ForeignKey(_code), index=True)
+    _family = orm.relationship('Family', remote_side=_code)
+    @hybrid.hybrid_property
     def family(self) -> 'Family':
         return self._family
 
-    _wikidata_item = Column('wikidata_item', Unicode, index=True)
-    @hybrid_property
+    _wikidata_item = sqla.Column('wikidata_item', sqla.Unicode, index=True)
+    @hybrid.hybrid_property
     def wikipedia_article(self) -> str:
         return self._wikidata_item
 
     def __init__(
             self,
-            session: Session,
+            session: orm.session.Session,
             code: str,
             canonicalName: str,
-            otherNames: List[str] = [],
+            otherNames: typing.List[str] = [],
             protoLanguage: 'Language' = None,
             family: 'Family' = None,
             wikidata_item: str = None):
@@ -67,5 +66,20 @@ class Family(BASE):
         return f'<family [{self.code}] : {self.canonical_name}>'
 
     @classmethod
-    def get_all(cls, session: Session) -> 'List[Family]':
-        return session.query(cls).all()
+    def get_all_as_dict(cls, session: orm.session.Session) -> typing.Dict:
+        return {family.code: family for family in session.query(cls).all()}
+
+    @classmethod
+    def create_all_from_module(cls, session: orm.session.Session):
+        family_dicts = luamodules.execute_module('Module2/Module:families/data.lua')
+        families = {}
+        delayed_relationships = []
+        for code, value in family_dicts.items():
+            parent_code = value.pop('family', None)
+            if parent_code:
+                delayed_relationships.append((code, parent_code))
+            family = cls(session, code, **value)
+            families[code] = family
+        for code, parent_code in delayed_relationships:
+            families[code]._parent = families[parent_code]
+        return families
